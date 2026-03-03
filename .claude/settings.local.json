@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo docker compose up -d --force-recreate ingestion-service 2>&1 | tail -5)",
+      "Bash(sudo docker compose build quant-engine options-agent 2>&1 | tail -15)",
+      "Bash(sudo docker compose --profile full up -d quant-engine options-agent 2>&1 | tail -10)",
+      "Bash(sudo docker compose build portfolio-service risk-engine 2>&1 | tail -10)",
+      "Bash(sudo docker compose --profile full up -d portfolio-service risk-engine 2>&1 | tail -10)"
+    ]
+  }
+}

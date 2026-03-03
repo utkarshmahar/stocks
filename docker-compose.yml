@@ -1,0 +1,193 @@
+version: "3.8"
+
+x-common: &common
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  env_file:
+    - .env
+
+services:
+  # ---- Infrastructure ----
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ---- Core Services (default profile) ----
+  ingestion-service:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/ingestion-service/Dockerfile
+    volumes:
+      - ./schwab_token.json:/app/schwab_token.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  api-gateway:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  frontend:
+    <<: *common
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:80"
+    depends_on:
+      - api-gateway
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ---- Full Profile Services ----
+  quant-engine:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/quant-engine/Dockerfile
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  options-agent:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/options-agent/Dockerfile
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  portfolio-service:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/portfolio-service/Dockerfile
+    profiles: ["full"]
+    volumes:
+      - ./schwab_token.json:/app/schwab_token.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  risk-engine:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/risk-engine/Dockerfile
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  fundamental-agent:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/fundamental-agent/Dockerfile
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  worker:
+    <<: *common
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  postgres_data:
+  redis_data:
