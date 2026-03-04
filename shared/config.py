@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
 
     # Ingestion
-    query_interval: int = 30
+    query_interval: int = 10
     strike_count: int = 10
     default_symbols: str = "PANW,QCOM,CSCO"
 

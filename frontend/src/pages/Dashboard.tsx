@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { apiFetch } from '../hooks/useApi'
@@ -76,6 +76,11 @@ export default function Dashboard() {
   const [timeRange, setTimeRange] = useState<string>('1d')
   const [priceTimeRange, setPriceTimeRange] = useState<string>('1d')
 
+  // Live data from WebSocket (keyed by symbol)
+  const [liveQuotes, setLiveQuotes] = useState<Record<string, Quote>>({})
+  const [liveOptions, setLiveOptions] = useState<Record<string, { calls: OptionContract[]; puts: OptionContract[] }>>({})
+  const lastUpdateRef = useRef<string>('')
+
   const wsUrl = `ws://${window.location.host}/ws/options`
   const { lastMessage, connected } = useWebSocket(wsUrl)
 
@@ -84,17 +89,22 @@ export default function Dashboard() {
     queryFn: () => apiFetch<any[]>('/watchlist'),
   })
 
-  const { data: quote } = useQuery({
+  // Initial load from InfluxDB (fallback until WebSocket data arrives)
+  const { data: initialQuote } = useQuery({
     queryKey: ['quote', selectedSymbol],
     queryFn: () => apiFetch<Quote>(`/quote/${selectedSymbol}`),
-    refetchInterval: 15000,
+    staleTime: Infinity, // only fetch once, WebSocket takes over
   })
 
-  const { data: options } = useQuery({
+  const { data: initialOptions } = useQuery({
     queryKey: ['options', selectedSymbol],
     queryFn: () => apiFetch<{ calls: OptionContract[]; puts: OptionContract[] }>(`/options/${selectedSymbol}`),
-    refetchInterval: 30000,
+    staleTime: Infinity, // only fetch once, WebSocket takes over
   })
+
+  // Use live data if available, fall back to initial HTTP fetch
+  const quote = liveQuotes[selectedSymbol] || initialQuote
+  const options = liveOptions[selectedSymbol] || initialOptions
 
   const { data: greekHistory, isLoading: greekLoading } = useQuery({
     queryKey: ['greekHistory', greekModal?.symbol, greekModal?.option_type, greekModal?.expiration, greekModal?.strike, greekModal?.greek, timeRange],
@@ -129,6 +139,55 @@ export default function Dashboard() {
     enabled: !!priceModal,
   })
 
+  // Process WebSocket messages — update live quote, options, and price chart
+  useEffect(() => {
+    if (!lastMessage?.symbol) return
+
+    const sym = lastMessage.symbol
+    const msgKey = `${sym}-${lastMessage.timestamp}`
+    if (msgKey === lastUpdateRef.current) return
+    lastUpdateRef.current = msgKey
+
+    // Update live quote
+    if (lastMessage.quote) {
+      const q = lastMessage.quote
+      setLiveQuotes(prev => ({
+        ...prev,
+        [sym]: {
+          symbol: sym,
+          price: q.price || 0,
+          bid: q.bid || 0,
+          ask: q.ask || 0,
+          change: q.change || 0,
+          percent_change: q.percent_change || 0,
+          volume: q.volume || 0,
+          high: q.high || 0,
+          low: q.low || 0,
+          open: q.open || 0,
+        }
+      }))
+    }
+
+    // Update live options
+    if (lastMessage.calls || lastMessage.puts) {
+      setLiveOptions(prev => ({
+        ...prev,
+        [sym]: {
+          calls: lastMessage.calls || [],
+          puts: lastMessage.puts || [],
+        }
+      }))
+    }
+
+    // Update price chart for selected symbol
+    if (sym === selectedSymbol && lastMessage.quote?.price) {
+      setPriceHistory(prev => {
+        const next = [...prev, { time: new Date().toLocaleTimeString(), price: lastMessage.quote.price }]
+        return next.slice(-60)
+      })
+    }
+  }, [lastMessage, selectedSymbol])
+
   // Close modal on Escape
   useEffect(() => {
     if (!greekModal && !priceModal) return
@@ -138,16 +197,6 @@ export default function Dashboard() {
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [greekModal, priceModal])
-
-  // Update price history from WebSocket
-  useEffect(() => {
-    if (lastMessage?.symbol === selectedSymbol && lastMessage?.quote?.price) {
-      setPriceHistory(prev => {
-        const next = [...prev, { time: new Date().toLocaleTimeString(), price: lastMessage.quote.price }]
-        return next.slice(-60)
-      })
-    }
-  }, [lastMessage, selectedSymbol])
 
   // Group options by expiration
   const expirations = useMemo(() => {
@@ -417,7 +466,6 @@ export default function Dashboard() {
           onClick={(e) => { if (e.target === e.currentTarget) setGreekModal(null) }}
         >
           <div className="bg-gray-900 rounded-xl border border-gray-700 shadow-2xl w-[95vw] max-w-7xl max-h-[90vh] overflow-auto">
-            {/* Header */}
             <div className="flex items-center justify-between p-5 border-b border-gray-700">
               <div>
                 <h2 className="text-xl font-bold">
@@ -425,30 +473,13 @@ export default function Dashboard() {
                 </h2>
                 <p className="text-base text-purple-400 font-medium mt-1">{GREEK_LABELS[greekModal.greek]} History</p>
               </div>
-              <button
-                onClick={() => setGreekModal(null)}
-                className="text-gray-400 hover:text-white text-3xl leading-none px-3"
-              >
-                &times;
-              </button>
+              <button onClick={() => setGreekModal(null)} className="text-gray-400 hover:text-white text-3xl leading-none px-3">&times;</button>
             </div>
-
-            {/* Time Range Selector */}
             <div className="flex gap-3 px-5 pt-5">
               {TIME_RANGES.map(r => (
-                <button
-                  key={r}
-                  onClick={() => setTimeRange(r)}
-                  className={`px-4 py-1.5 rounded text-sm font-medium ${
-                    timeRange === r ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-                  }`}
-                >
-                  {r}
-                </button>
+                <button key={r} onClick={() => setTimeRange(r)} className={`px-4 py-1.5 rounded text-sm font-medium ${timeRange === r ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>{r}</button>
               ))}
             </div>
-
-            {/* Charts */}
             <div className="p-5">
               {greekLoading ? (
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">Loading history...</div>
@@ -456,7 +487,6 @@ export default function Dashboard() {
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">No historical data available for this contract and time range.</div>
               ) : (
                 <div className="space-y-8">
-                  {/* Greek Chart */}
                   <div>
                     <h3 className="text-base font-medium text-purple-400 mb-3">{GREEK_LABELS[greekModal.greek]} Over Time</h3>
                     {greekHistory?.greek_history?.length ? (
@@ -464,12 +494,7 @@ export default function Dashboard() {
                         <LineChart data={greekHistory.greek_history}>
                           <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip
-                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
-                            labelStyle={{ color: '#9ca3af' }}
-                            labelFormatter={formatGreekTime}
-                            formatter={(v: number) => [v.toFixed(4), GREEK_LABELS[greekModal.greek]]}
-                          />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [v.toFixed(4), GREEK_LABELS[greekModal.greek]]} />
                           <Line type="monotone" dataKey="value" stroke="#8b5cf6" dot={false} strokeWidth={2.5} />
                         </LineChart>
                       </ResponsiveContainer>
@@ -477,8 +502,6 @@ export default function Dashboard() {
                       <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
                     )}
                   </div>
-
-                  {/* Price Chart */}
                   <div>
                     <h3 className="text-base font-medium text-emerald-400 mb-3">{greekModal.symbol} Price Over Time</h3>
                     {greekHistory?.price_history?.length ? (
@@ -486,12 +509,7 @@ export default function Dashboard() {
                         <LineChart data={greekHistory.price_history}>
                           <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip
-                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
-                            labelStyle={{ color: '#9ca3af' }}
-                            labelFormatter={formatGreekTime}
-                            formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']}
-                          />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']} />
                           <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
                         </LineChart>
                       </ResponsiveContainer>
@@ -513,7 +531,6 @@ export default function Dashboard() {
           onClick={(e) => { if (e.target === e.currentTarget) setPriceModal(null) }}
         >
           <div className="bg-gray-900 rounded-xl border border-gray-700 shadow-2xl w-[95vw] max-w-7xl max-h-[90vh] overflow-auto">
-            {/* Header */}
             <div className="flex items-center justify-between p-5 border-b border-gray-700">
               <div>
                 <h2 className="text-xl font-bold">
@@ -521,30 +538,13 @@ export default function Dashboard() {
                 </h2>
                 <p className="text-base text-blue-400 font-medium mt-1">Bid / Ask / LTP History</p>
               </div>
-              <button
-                onClick={() => setPriceModal(null)}
-                className="text-gray-400 hover:text-white text-3xl leading-none px-3"
-              >
-                &times;
-              </button>
+              <button onClick={() => setPriceModal(null)} className="text-gray-400 hover:text-white text-3xl leading-none px-3">&times;</button>
             </div>
-
-            {/* Time Range Selector */}
             <div className="flex gap-3 px-5 pt-5">
               {TIME_RANGES.map(r => (
-                <button
-                  key={r}
-                  onClick={() => setPriceTimeRange(r)}
-                  className={`px-4 py-1.5 rounded text-sm font-medium ${
-                    priceTimeRange === r ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-                  }`}
-                >
-                  {r}
-                </button>
+                <button key={r} onClick={() => setPriceTimeRange(r)} className={`px-4 py-1.5 rounded text-sm font-medium ${priceTimeRange === r ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>{r}</button>
               ))}
             </div>
-
-            {/* Charts */}
             <div className="p-5">
               {optionPriceLoading ? (
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">Loading history...</div>
@@ -552,7 +552,6 @@ export default function Dashboard() {
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">No historical data available for this contract and time range.</div>
               ) : (
                 <div className="space-y-8">
-                  {/* Bid/Ask/LTP Combined Chart */}
                   <div>
                     <h3 className="text-base font-medium text-blue-400 mb-3">Option Bid / Ask / LTP Over Time</h3>
                     {mergedOptionPrices.length ? (
@@ -560,12 +559,7 @@ export default function Dashboard() {
                         <LineChart data={mergedOptionPrices}>
                           <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip
-                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
-                            labelStyle={{ color: '#9ca3af' }}
-                            labelFormatter={formatPriceTime}
-                            formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name.charAt(0).toUpperCase() + name.slice(1)]}
-                          />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name.charAt(0).toUpperCase() + name.slice(1)]} />
                           <Legend wrapperStyle={{ fontSize: 13 }} />
                           <Line type="monotone" dataKey="bid" stroke="#f59e0b" dot={false} strokeWidth={2} name="Bid" />
                           <Line type="monotone" dataKey="ask" stroke="#ef4444" dot={false} strokeWidth={2} name="Ask" />
@@ -576,8 +570,6 @@ export default function Dashboard() {
                       <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
                     )}
                   </div>
-
-                  {/* Stock Price Chart */}
                   <div>
                     <h3 className="text-base font-medium text-emerald-400 mb-3">{priceModal.symbol} Stock Price Over Time</h3>
                     {optionPriceHistory?.price_history?.length ? (
@@ -585,12 +577,7 @@ export default function Dashboard() {
                         <LineChart data={optionPriceHistory.price_history}>
                           <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip
-                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
-                            labelStyle={{ color: '#9ca3af' }}
-                            labelFormatter={formatPriceTime}
-                            formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']}
-                          />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']} />
                           <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
                         </LineChart>
                       </ResponsiveContainer>

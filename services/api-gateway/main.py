@@ -71,7 +71,7 @@ async def remove_from_watchlist(symbol: str, db: AsyncSession = Depends(get_db))
 async def get_quote(symbol: str):
     query = f'''
     from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
+      |> range(start: -1d)
       |> filter(fn: (r) => r._measurement == "stock_quote" and r.symbol == "{symbol.upper()}")
       |> last()
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -99,7 +99,7 @@ async def get_quote(symbol: str):
 async def get_options(symbol: str):
     query = f'''
     from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
+      |> range(start: -1d)
       |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol.upper()}")
       |> last()
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")

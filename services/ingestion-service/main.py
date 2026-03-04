@@ -199,6 +199,9 @@ def parse_options_for_redis(symbol: str, data: dict) -> dict:
         "change": underlying.get("change", 0),
         "percent_change": underlying.get("percentChange", 0),
         "volume": underlying.get("totalVolume", 0),
+        "high": underlying.get("highPrice", 0),
+        "low": underlying.get("lowPrice", 0),
+        "open": underlying.get("openPrice", 0),
     }
 
     calls = []
@@ -240,10 +243,16 @@ def parse_options_for_redis(symbol: str, data: dict) -> dict:
 
 
 async def ingestion_loop():
-    """Main ingestion loop — polls Schwab, writes to InfluxDB, publishes to Redis."""
+    """Main ingestion loop — polls Schwab, writes to InfluxDB, publishes to Redis.
+
+    Polls every query_interval seconds (default 10s) and always publishes to Redis
+    for live dashboard updates. Writes to InfluxDB only every 3rd cycle (~30s)
+    to reduce disk I/O on the Pi.
+    """
     import traceback
+    influx_write_interval = 3  # write to InfluxDB every Nth cycle
     try:
-        print(f"[INGESTION] Starting. Interval={settings.query_interval}s, Strikes={settings.strike_count}", flush=True)
+        print(f"[INGESTION] Starting. Poll={settings.query_interval}s, InfluxDB write=every {settings.query_interval * influx_write_interval}s, Strikes={settings.strike_count}", flush=True)
         client = get_schwab_client()
         print("[INGESTION] Schwab client authenticated.", flush=True)
     except Exception as e:
@@ -251,36 +260,42 @@ async def ingestion_loop():
         traceback.print_exc()
         return
 
+    cycle = 0
     while True:
         try:
             symbols = await get_watchlist_symbols()
             redis = await get_redis()
+            write_influx = (cycle % influx_write_interval == 0)
+
             for symbol in symbols:
                 data = query_options_chain(client, symbol)
                 if data is None:
                     continue
 
-                # Build line protocol and filter by trading hours
-                lines = build_line_protocol(symbol, data)
-                filtered_lines = filter_by_trading_hours(lines)
-
-                # Write to InfluxDB (only if records remain after filtering)
                 underlying_price = data.get("underlying", {}).get("last", "N/A")
-                if filtered_lines:
-                    success = await influx_write(filtered_lines)
-                    status = "OK" if success else "FAIL"
-                    print(f"[INGESTION] {symbol}: price={underlying_price}, records={len(filtered_lines)}/{len(lines)}, influx={status}", flush=True)
-                else:
-                    print(f"[INGESTION] {symbol}: price={underlying_price}, records skipped (outside trading hours)", flush=True)
 
-                # Publish to Redis for WebSocket streaming
+                # Always publish to Redis for live dashboard streaming
                 snapshot = parse_options_for_redis(symbol, data)
                 await redis.publish("options:updates", json.dumps(snapshot))
+
+                # Write to InfluxDB only every Nth cycle
+                if write_influx:
+                    lines = build_line_protocol(symbol, data)
+                    filtered_lines = filter_by_trading_hours(lines)
+                    if filtered_lines:
+                        success = await influx_write(filtered_lines)
+                        status = "OK" if success else "FAIL"
+                        print(f"[INGESTION] {symbol}: price={underlying_price}, records={len(filtered_lines)}/{len(lines)}, influx={status}", flush=True)
+                    else:
+                        print(f"[INGESTION] {symbol}: price={underlying_price}, records skipped (outside trading hours)", flush=True)
+                else:
+                    print(f"[INGESTION] {symbol}: price={underlying_price}, redis=OK", flush=True)
 
         except Exception as e:
             print(f"[INGESTION] Error: {e}", flush=True)
             traceback.print_exc()
 
+        cycle += 1
         await asyncio.sleep(settings.query_interval)
 
 
