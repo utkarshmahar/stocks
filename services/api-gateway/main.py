@@ -257,6 +257,160 @@ async def services_health():
     return results
 
 
+# ---- Greek History ----
+
+GREEK_FIELD_MAP = {
+    "iv": "implied_volatility",
+    "delta": "delta",
+    "gamma": "gamma",
+    "theta": "theta",
+}
+
+TIME_RANGE_MAP = {
+    "1d": "-1d",
+    "3d": "-3d",
+    "1w": "-7d",
+    "1m": "-30d",
+}
+
+
+@app.get("/api/history/greek")
+async def get_greek_history(
+    symbol: str,
+    option_type: str,
+    expiration: str,
+    strike: float,
+    greek: str,
+    time_range: str = "1d",
+):
+    field = GREEK_FIELD_MAP.get(greek)
+    if not field:
+        raise HTTPException(400, f"Invalid greek: {greek}. Use: iv, delta, gamma, theta")
+    flux_range = TIME_RANGE_MAP.get(time_range, "-1d")
+    strike_str = str(strike)
+
+    # Aggregate for longer ranges to reduce data volume on Pi
+    aggregate = ""
+    if time_range in ("1w", "1m"):
+        window = "1h" if time_range == "1m" else "15m"
+        aggregate = f'|> aggregateWindow(every: {window}, fn: mean, createEmpty: false)'
+
+    greek_query = f'''
+    from(bucket: "{settings.influxdb_bucket}")
+      |> range(start: {flux_range})
+      |> filter(fn: (r) => r._measurement == "options_data")
+      |> filter(fn: (r) => r.symbol == "{symbol.upper()}")
+      |> filter(fn: (r) => r.option_type == "{option_type.upper()}")
+      |> filter(fn: (r) => r.expiration == "{expiration}")
+      |> filter(fn: (r) => r.strike == "{strike_str}")
+      |> filter(fn: (r) => r._field == "{field}")
+      {aggregate}
+      |> sort(columns: ["_time"])
+    '''
+
+    price_query = f'''
+    from(bucket: "{settings.influxdb_bucket}")
+      |> range(start: {flux_range})
+      |> filter(fn: (r) => r._measurement == "stock_quote")
+      |> filter(fn: (r) => r.symbol == "{symbol.upper()}")
+      |> filter(fn: (r) => r._field == "price")
+      {aggregate}
+      |> sort(columns: ["_time"])
+    '''
+
+    greek_rows, price_rows = await asyncio.gather(
+        influx_query(greek_query),
+        influx_query(price_query),
+    )
+
+    greek_history = [
+        {"time": r["_time"], "value": float(r["_value"])}
+        for r in greek_rows if r.get("_value") is not None
+    ]
+    price_history = [
+        {"time": r["_time"], "value": float(r["_value"])}
+        for r in price_rows if r.get("_value") is not None
+    ]
+
+    return {
+        "contract": {
+            "symbol": symbol.upper(),
+            "strike": strike,
+            "expiration": expiration,
+            "option_type": option_type.upper(),
+            "greek": greek,
+        },
+        "greek_history": greek_history,
+        "price_history": price_history,
+    }
+
+
+# ---- Option Price History (Bid/Ask/Last) ----
+
+@app.get("/api/history/option-price")
+async def get_option_price_history(
+    symbol: str,
+    option_type: str,
+    expiration: str,
+    strike: float,
+    time_range: str = "1d",
+):
+    flux_range = TIME_RANGE_MAP.get(time_range, "-1d")
+    strike_str = str(strike)
+
+    aggregate = ""
+    if time_range in ("1w", "1m"):
+        window = "1h" if time_range == "1m" else "15m"
+        aggregate = f'|> aggregateWindow(every: {window}, fn: mean, createEmpty: false)'
+
+    def make_field_query(field: str) -> str:
+        return f'''
+        from(bucket: "{settings.influxdb_bucket}")
+          |> range(start: {flux_range})
+          |> filter(fn: (r) => r._measurement == "options_data")
+          |> filter(fn: (r) => r.symbol == "{symbol.upper()}")
+          |> filter(fn: (r) => r.option_type == "{option_type.upper()}")
+          |> filter(fn: (r) => r.expiration == "{expiration}")
+          |> filter(fn: (r) => r.strike == "{strike_str}")
+          |> filter(fn: (r) => r._field == "{field}")
+          {aggregate}
+          |> sort(columns: ["_time"])
+        '''
+
+    stock_query = f'''
+    from(bucket: "{settings.influxdb_bucket}")
+      |> range(start: {flux_range})
+      |> filter(fn: (r) => r._measurement == "stock_quote")
+      |> filter(fn: (r) => r.symbol == "{symbol.upper()}")
+      |> filter(fn: (r) => r._field == "price")
+      {aggregate}
+      |> sort(columns: ["_time"])
+    '''
+
+    bid_rows, ask_rows, last_rows, stock_rows = await asyncio.gather(
+        influx_query(make_field_query("bid")),
+        influx_query(make_field_query("ask")),
+        influx_query(make_field_query("last")),
+        influx_query(stock_query),
+    )
+
+    def to_series(rows):
+        return [{"time": r["_time"], "value": float(r["_value"])} for r in rows if r.get("_value") is not None]
+
+    return {
+        "contract": {
+            "symbol": symbol.upper(),
+            "strike": strike,
+            "expiration": expiration,
+            "option_type": option_type.upper(),
+        },
+        "bid_history": to_series(bid_rows),
+        "ask_history": to_series(ask_rows),
+        "last_history": to_series(last_rows),
+        "price_history": to_series(stock_rows),
+    }
+
+
 # ---- WebSocket: Live Options Updates ----
 
 @app.websocket("/ws/options")

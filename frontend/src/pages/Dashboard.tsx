@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { apiFetch } from '../hooks/useApi'
 import { useWebSocket } from '../hooks/useWebSocket'
 
@@ -35,11 +35,48 @@ interface OptionContract {
   itm: boolean
 }
 
+interface GreekModal {
+  symbol: string
+  strike: number
+  expiration: string
+  option_type: 'CALL' | 'PUT'
+  greek: 'iv' | 'delta' | 'gamma' | 'theta'
+}
+
+interface PriceModal {
+  symbol: string
+  strike: number
+  expiration: string
+  option_type: 'CALL' | 'PUT'
+  clicked: 'bid' | 'ask' | 'last'
+}
+
+interface GreekHistoryResponse {
+  contract: { symbol: string; strike: number; expiration: string; option_type: string; greek: string }
+  greek_history: { time: string; value: number }[]
+  price_history: { time: string; value: number }[]
+}
+
+interface OptionPriceHistoryResponse {
+  contract: { symbol: string; strike: number; expiration: string; option_type: string }
+  bid_history: { time: string; value: number }[]
+  ask_history: { time: string; value: number }[]
+  last_history: { time: string; value: number }[]
+  price_history: { time: string; value: number }[]
+}
+
+const GREEK_LABELS: Record<string, string> = { iv: 'IV', delta: 'Delta', gamma: 'Gamma', theta: 'Theta' }
+const TIME_RANGES = ['1d', '3d', '1w', '1m'] as const
+
 export default function Dashboard() {
   const [selectedSymbol, setSelectedSymbol] = useState('PANW')
   const [priceHistory, setPriceHistory] = useState<{ time: string; price: number }[]>([])
+  const [greekModal, setGreekModal] = useState<GreekModal | null>(null)
+  const [priceModal, setPriceModal] = useState<PriceModal | null>(null)
+  const [timeRange, setTimeRange] = useState<string>('1d')
+  const [priceTimeRange, setPriceTimeRange] = useState<string>('1d')
 
-  const wsUrl = `ws://${window.location.hostname}:8000/ws/options`
+  const wsUrl = `ws://${window.location.host}/ws/options`
   const { lastMessage, connected } = useWebSocket(wsUrl)
 
   const { data: watchlist } = useQuery({
@@ -58,6 +95,49 @@ export default function Dashboard() {
     queryFn: () => apiFetch<{ calls: OptionContract[]; puts: OptionContract[] }>(`/options/${selectedSymbol}`),
     refetchInterval: 30000,
   })
+
+  const { data: greekHistory, isLoading: greekLoading } = useQuery({
+    queryKey: ['greekHistory', greekModal?.symbol, greekModal?.option_type, greekModal?.expiration, greekModal?.strike, greekModal?.greek, timeRange],
+    queryFn: () => {
+      if (!greekModal) return null
+      const params = new URLSearchParams({
+        symbol: greekModal.symbol,
+        option_type: greekModal.option_type,
+        expiration: greekModal.expiration,
+        strike: greekModal.strike.toString(),
+        greek: greekModal.greek,
+        time_range: timeRange,
+      })
+      return apiFetch<GreekHistoryResponse>(`/history/greek?${params}`)
+    },
+    enabled: !!greekModal,
+  })
+
+  const { data: optionPriceHistory, isLoading: optionPriceLoading } = useQuery({
+    queryKey: ['optionPriceHistory', priceModal?.symbol, priceModal?.option_type, priceModal?.expiration, priceModal?.strike, priceTimeRange],
+    queryFn: () => {
+      if (!priceModal) return null
+      const params = new URLSearchParams({
+        symbol: priceModal.symbol,
+        option_type: priceModal.option_type,
+        expiration: priceModal.expiration,
+        strike: priceModal.strike.toString(),
+        time_range: priceTimeRange,
+      })
+      return apiFetch<OptionPriceHistoryResponse>(`/history/option-price?${params}`)
+    },
+    enabled: !!priceModal,
+  })
+
+  // Close modal on Escape
+  useEffect(() => {
+    if (!greekModal && !priceModal) return
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setGreekModal(null); setPriceModal(null) }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [greekModal, priceModal])
 
   // Update price history from WebSocket
   useEffect(() => {
@@ -87,6 +167,81 @@ export default function Dashboard() {
   const filteredPuts = options?.puts.filter(p => p.expiration === selectedExp) || []
 
   const activeSymbols = watchlist?.filter((w: any) => w.active).map((w: any) => w.symbol) || ['PANW', 'QCOM', 'CSCO']
+
+  const openGreekModal = useCallback((contract: OptionContract, optionType: 'CALL' | 'PUT', greek: 'iv' | 'delta' | 'gamma' | 'theta') => {
+    setGreekModal({
+      symbol: selectedSymbol,
+      strike: contract.strike,
+      expiration: contract.expiration,
+      option_type: optionType,
+      greek,
+    })
+    setTimeRange('1d')
+  }, [selectedSymbol])
+
+  const openPriceModal = useCallback((contract: OptionContract, optionType: 'CALL' | 'PUT', clicked: 'bid' | 'ask' | 'last') => {
+    setPriceModal({
+      symbol: selectedSymbol,
+      strike: contract.strike,
+      expiration: contract.expiration,
+      option_type: optionType,
+      clicked,
+    })
+    setPriceTimeRange('1d')
+  }, [selectedSymbol])
+
+  const formatTime = useCallback((time: string, range: string) => {
+    try {
+      const d = new Date(time)
+      return range === '1d' ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : d.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    } catch { return time }
+  }, [])
+
+  const formatGreekTime = useCallback((time: string) => formatTime(time, timeRange), [formatTime, timeRange])
+  const formatPriceTime = useCallback((time: string) => formatTime(time, priceTimeRange), [formatTime, priceTimeRange])
+
+  const renderGreekCell = (contract: OptionContract, optionType: 'CALL' | 'PUT', greek: 'iv' | 'delta' | 'gamma' | 'theta', value: string) => (
+    <td
+      className="p-2 text-right cursor-pointer hover:bg-gray-700/50 hover:text-purple-300 transition-colors rounded"
+      onClick={() => openGreekModal(contract, optionType, greek)}
+      title={`Click to view ${GREEK_LABELS[greek]} history`}
+    >
+      {value}
+    </td>
+  )
+
+  const renderPriceCell = (contract: OptionContract, optionType: 'CALL' | 'PUT', field: 'bid' | 'ask' | 'last', value: string) => (
+    <td
+      className="p-2 text-right cursor-pointer hover:bg-gray-700/50 hover:text-blue-300 transition-colors rounded"
+      onClick={() => openPriceModal(contract, optionType, field)}
+      title="Click to view Bid/Ask/LTP history"
+    >
+      {value}
+    </td>
+  )
+
+  // Merge bid/ask/last histories into a single array for combined chart
+  const mergedOptionPrices = useMemo(() => {
+    if (!optionPriceHistory) return []
+    const timeMap = new Map<string, { time: string; bid?: number; ask?: number; last?: number }>()
+    for (const p of optionPriceHistory.bid_history) {
+      const entry = timeMap.get(p.time) || { time: p.time }
+      entry.bid = p.value
+      timeMap.set(p.time, entry)
+    }
+    for (const p of optionPriceHistory.ask_history) {
+      const entry = timeMap.get(p.time) || { time: p.time }
+      entry.ask = p.value
+      timeMap.set(p.time, entry)
+    }
+    for (const p of optionPriceHistory.last_history) {
+      const entry = timeMap.get(p.time) || { time: p.time }
+      entry.last = p.value
+      timeMap.set(p.time, entry)
+    }
+    return Array.from(timeMap.values()).sort((a, b) => a.time.localeCompare(b.time))
+  }, [optionPriceHistory])
 
   return (
     <div className="space-y-6">
@@ -184,22 +339,28 @@ export default function Dashboard() {
                   <th className="p-2 text-left">Strike</th>
                   <th className="p-2 text-right">Bid</th>
                   <th className="p-2 text-right">Ask</th>
+                  <th className="p-2 text-right">LTP</th>
                   <th className="p-2 text-right">Vol</th>
                   <th className="p-2 text-right">OI</th>
                   <th className="p-2 text-right">IV</th>
                   <th className="p-2 text-right">Delta</th>
+                  <th className="p-2 text-right">Gamma</th>
+                  <th className="p-2 text-right">Theta</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredCalls.sort((a, b) => a.strike - b.strike).map((c, i) => (
                   <tr key={i} className={`border-b border-gray-800/50 ${c.itm ? 'bg-emerald-900/10' : ''}`}>
                     <td className="p-2 font-medium">{c.strike.toFixed(1)}</td>
-                    <td className="p-2 text-right">{c.bid.toFixed(2)}</td>
-                    <td className="p-2 text-right">{c.ask.toFixed(2)}</td>
+                    {renderPriceCell(c, 'CALL', 'bid', c.bid.toFixed(2))}
+                    {renderPriceCell(c, 'CALL', 'ask', c.ask.toFixed(2))}
+                    {renderPriceCell(c, 'CALL', 'last', c.last.toFixed(2))}
                     <td className="p-2 text-right">{c.volume}</td>
                     <td className="p-2 text-right">{c.open_interest}</td>
-                    <td className="p-2 text-right">{(c.iv).toFixed(1)}%</td>
-                    <td className="p-2 text-right">{c.delta.toFixed(3)}</td>
+                    {renderGreekCell(c, 'CALL', 'iv', `${c.iv.toFixed(1)}%`)}
+                    {renderGreekCell(c, 'CALL', 'delta', c.delta.toFixed(3))}
+                    {renderGreekCell(c, 'CALL', 'gamma', c.gamma.toFixed(4))}
+                    {renderGreekCell(c, 'CALL', 'theta', c.theta.toFixed(3))}
                   </tr>
                 ))}
               </tbody>
@@ -219,22 +380,28 @@ export default function Dashboard() {
                   <th className="p-2 text-left">Strike</th>
                   <th className="p-2 text-right">Bid</th>
                   <th className="p-2 text-right">Ask</th>
+                  <th className="p-2 text-right">LTP</th>
                   <th className="p-2 text-right">Vol</th>
                   <th className="p-2 text-right">OI</th>
                   <th className="p-2 text-right">IV</th>
                   <th className="p-2 text-right">Delta</th>
+                  <th className="p-2 text-right">Gamma</th>
+                  <th className="p-2 text-right">Theta</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredPuts.sort((a, b) => a.strike - b.strike).map((p, i) => (
                   <tr key={i} className={`border-b border-gray-800/50 ${p.itm ? 'bg-red-900/10' : ''}`}>
                     <td className="p-2 font-medium">{p.strike.toFixed(1)}</td>
-                    <td className="p-2 text-right">{p.bid.toFixed(2)}</td>
-                    <td className="p-2 text-right">{p.ask.toFixed(2)}</td>
+                    {renderPriceCell(p, 'PUT', 'bid', p.bid.toFixed(2))}
+                    {renderPriceCell(p, 'PUT', 'ask', p.ask.toFixed(2))}
+                    {renderPriceCell(p, 'PUT', 'last', p.last.toFixed(2))}
                     <td className="p-2 text-right">{p.volume}</td>
                     <td className="p-2 text-right">{p.open_interest}</td>
-                    <td className="p-2 text-right">{(p.iv).toFixed(1)}%</td>
-                    <td className="p-2 text-right">{p.delta.toFixed(3)}</td>
+                    {renderGreekCell(p, 'PUT', 'iv', `${p.iv.toFixed(1)}%`)}
+                    {renderGreekCell(p, 'PUT', 'delta', p.delta.toFixed(3))}
+                    {renderGreekCell(p, 'PUT', 'gamma', p.gamma.toFixed(4))}
+                    {renderGreekCell(p, 'PUT', 'theta', p.theta.toFixed(3))}
                   </tr>
                 ))}
               </tbody>
@@ -242,6 +409,201 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Greek History Modal */}
+      {greekModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          onClick={(e) => { if (e.target === e.currentTarget) setGreekModal(null) }}
+        >
+          <div className="bg-gray-900 rounded-xl border border-gray-700 shadow-2xl w-[95vw] max-w-7xl max-h-[90vh] overflow-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between p-5 border-b border-gray-700">
+              <div>
+                <h2 className="text-xl font-bold">
+                  {greekModal.symbol} {greekModal.option_type} {greekModal.strike.toFixed(1)} — {greekModal.expiration}
+                </h2>
+                <p className="text-base text-purple-400 font-medium mt-1">{GREEK_LABELS[greekModal.greek]} History</p>
+              </div>
+              <button
+                onClick={() => setGreekModal(null)}
+                className="text-gray-400 hover:text-white text-3xl leading-none px-3"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Time Range Selector */}
+            <div className="flex gap-3 px-5 pt-5">
+              {TIME_RANGES.map(r => (
+                <button
+                  key={r}
+                  onClick={() => setTimeRange(r)}
+                  className={`px-4 py-1.5 rounded text-sm font-medium ${
+                    timeRange === r ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+
+            {/* Charts */}
+            <div className="p-5">
+              {greekLoading ? (
+                <div className="flex items-center justify-center h-96 text-gray-500 text-lg">Loading history...</div>
+              ) : !greekHistory?.greek_history?.length && !greekHistory?.price_history?.length ? (
+                <div className="flex items-center justify-center h-96 text-gray-500 text-lg">No historical data available for this contract and time range.</div>
+              ) : (
+                <div className="space-y-8">
+                  {/* Greek Chart */}
+                  <div>
+                    <h3 className="text-base font-medium text-purple-400 mb-3">{GREEK_LABELS[greekModal.greek]} Over Time</h3>
+                    {greekHistory?.greek_history?.length ? (
+                      <ResponsiveContainer width="100%" height={350}>
+                        <LineChart data={greekHistory.greek_history}>
+                          <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
+                          <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
+                          <Tooltip
+                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
+                            labelStyle={{ color: '#9ca3af' }}
+                            labelFormatter={formatGreekTime}
+                            formatter={(v: number) => [v.toFixed(4), GREEK_LABELS[greekModal.greek]]}
+                          />
+                          <Line type="monotone" dataKey="value" stroke="#8b5cf6" dot={false} strokeWidth={2.5} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
+                    )}
+                  </div>
+
+                  {/* Price Chart */}
+                  <div>
+                    <h3 className="text-base font-medium text-emerald-400 mb-3">{greekModal.symbol} Price Over Time</h3>
+                    {greekHistory?.price_history?.length ? (
+                      <ResponsiveContainer width="100%" height={350}>
+                        <LineChart data={greekHistory.price_history}>
+                          <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
+                          <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
+                          <Tooltip
+                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
+                            labelStyle={{ color: '#9ca3af' }}
+                            labelFormatter={formatGreekTime}
+                            formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']}
+                          />
+                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Option Price History Modal (Bid/Ask/LTP) */}
+      {priceModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          onClick={(e) => { if (e.target === e.currentTarget) setPriceModal(null) }}
+        >
+          <div className="bg-gray-900 rounded-xl border border-gray-700 shadow-2xl w-[95vw] max-w-7xl max-h-[90vh] overflow-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between p-5 border-b border-gray-700">
+              <div>
+                <h2 className="text-xl font-bold">
+                  {priceModal.symbol} {priceModal.option_type} {priceModal.strike.toFixed(1)} — {priceModal.expiration}
+                </h2>
+                <p className="text-base text-blue-400 font-medium mt-1">Bid / Ask / LTP History</p>
+              </div>
+              <button
+                onClick={() => setPriceModal(null)}
+                className="text-gray-400 hover:text-white text-3xl leading-none px-3"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Time Range Selector */}
+            <div className="flex gap-3 px-5 pt-5">
+              {TIME_RANGES.map(r => (
+                <button
+                  key={r}
+                  onClick={() => setPriceTimeRange(r)}
+                  className={`px-4 py-1.5 rounded text-sm font-medium ${
+                    priceTimeRange === r ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+
+            {/* Charts */}
+            <div className="p-5">
+              {optionPriceLoading ? (
+                <div className="flex items-center justify-center h-96 text-gray-500 text-lg">Loading history...</div>
+              ) : !mergedOptionPrices.length && !optionPriceHistory?.price_history?.length ? (
+                <div className="flex items-center justify-center h-96 text-gray-500 text-lg">No historical data available for this contract and time range.</div>
+              ) : (
+                <div className="space-y-8">
+                  {/* Bid/Ask/LTP Combined Chart */}
+                  <div>
+                    <h3 className="text-base font-medium text-blue-400 mb-3">Option Bid / Ask / LTP Over Time</h3>
+                    {mergedOptionPrices.length ? (
+                      <ResponsiveContainer width="100%" height={350}>
+                        <LineChart data={mergedOptionPrices}>
+                          <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
+                          <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
+                          <Tooltip
+                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
+                            labelStyle={{ color: '#9ca3af' }}
+                            labelFormatter={formatPriceTime}
+                            formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name.charAt(0).toUpperCase() + name.slice(1)]}
+                          />
+                          <Legend wrapperStyle={{ fontSize: 13 }} />
+                          <Line type="monotone" dataKey="bid" stroke="#f59e0b" dot={false} strokeWidth={2} name="Bid" />
+                          <Line type="monotone" dataKey="ask" stroke="#ef4444" dot={false} strokeWidth={2} name="Ask" />
+                          <Line type="monotone" dataKey="last" stroke="#3b82f6" dot={false} strokeWidth={2.5} name="LTP" />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
+                    )}
+                  </div>
+
+                  {/* Stock Price Chart */}
+                  <div>
+                    <h3 className="text-base font-medium text-emerald-400 mb-3">{priceModal.symbol} Stock Price Over Time</h3>
+                    {optionPriceHistory?.price_history?.length ? (
+                      <ResponsiveContainer width="100%" height={350}>
+                        <LineChart data={optionPriceHistory.price_history}>
+                          <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
+                          <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
+                          <Tooltip
+                            contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }}
+                            labelStyle={{ color: '#9ca3af' }}
+                            labelFormatter={formatPriceTime}
+                            formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']}
+                          />
+                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex items-center justify-center h-[350px] text-gray-600">No data</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

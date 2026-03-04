@@ -2,7 +2,7 @@
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from schwab.client import Client
@@ -37,6 +37,50 @@ async def get_watchlist_symbols() -> list[str]:
     return settings.symbols_list
 
 
+def is_normal_trading_hours() -> bool:
+    """Check if current time is within normal trading hours (9:30 AM - 4:00 PM ET).
+
+    Options data is only written to InfluxDB during these hours.
+    Excludes weekends and US market holidays.
+    """
+    now = datetime.now(tz=timezone.utc).astimezone()  # Local time (ET on Pi)
+    weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+    # Skip weekends
+    if weekday >= 5:  # Saturday or Sunday
+        return False
+
+    # Check time: 9:30 AM - 4:00 PM
+    hour, minute = now.hour, now.minute
+    start = (9, 30)  # 9:30 AM
+    end = (16, 0)    # 4:00 PM
+
+    current = (hour, minute)
+    return start <= current < end
+
+
+def is_extended_trading_hours() -> bool:
+    """Check if current time is within extended trading hours (4:00 AM - 8:00 PM ET).
+
+    Stock prices are written to InfluxDB during these hours.
+    Excludes weekends and US market holidays.
+    """
+    now = datetime.now(tz=timezone.utc).astimezone()  # Local time (ET on Pi)
+    weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+    # Skip weekends
+    if weekday >= 5:  # Saturday or Sunday
+        return False
+
+    # Check time: 4:00 AM - 8:00 PM
+    hour, minute = now.hour, now.minute
+    start = (4, 0)   # 4:00 AM (pre-market)
+    end = (20, 0)    # 8:00 PM (after-hours)
+
+    current = (hour, minute)
+    return start <= current < end
+
+
 def query_options_chain(client, symbol: str) -> dict | None:
     """Query Schwab for options chain data."""
     try:
@@ -53,6 +97,31 @@ def query_options_chain(client, symbol: str) -> dict | None:
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
         return None
+
+
+def filter_by_trading_hours(lines: list[str]) -> list[str]:
+    """Filter line protocol based on trading hours.
+
+    - Options data: only during normal trading hours (9:30 AM - 4:00 PM ET)
+    - Stock prices: only during extended hours (4:00 AM - 8:00 PM ET)
+    """
+    normal_hours = is_normal_trading_hours()
+    extended_hours = is_extended_trading_hours()
+
+    filtered = []
+    for line in lines:
+        # Options data: only write during normal trading hours
+        if "options_data" in line:
+            if normal_hours:
+                filtered.append(line)
+        # Stock quotes: only write during extended hours
+        elif "stock_quote" in line:
+            if extended_hours:
+                filtered.append(line)
+        else:
+            filtered.append(line)
+
+    return filtered
 
 
 def build_line_protocol(symbol: str, data: dict) -> list[str]:
@@ -191,12 +260,18 @@ async def ingestion_loop():
                 if data is None:
                     continue
 
-                # Write to InfluxDB
+                # Build line protocol and filter by trading hours
                 lines = build_line_protocol(symbol, data)
-                success = await influx_write(lines)
+                filtered_lines = filter_by_trading_hours(lines)
+
+                # Write to InfluxDB (only if records remain after filtering)
                 underlying_price = data.get("underlying", {}).get("last", "N/A")
-                status = "OK" if success else "FAIL"
-                print(f"[INGESTION] {symbol}: price={underlying_price}, records={len(lines)}, influx={status}", flush=True)
+                if filtered_lines:
+                    success = await influx_write(filtered_lines)
+                    status = "OK" if success else "FAIL"
+                    print(f"[INGESTION] {symbol}: price={underlying_price}, records={len(filtered_lines)}/{len(lines)}, influx={status}", flush=True)
+                else:
+                    print(f"[INGESTION] {symbol}: price={underlying_price}, records skipped (outside trading hours)", flush=True)
 
                 # Publish to Redis for WebSocket streaming
                 snapshot = parse_options_for_redis(symbol, data)
