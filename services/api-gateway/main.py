@@ -231,6 +231,40 @@ async def update_config(key: str, payload: dict, db: AsyncSession = Depends(get_
     return {"key": key, "value": value}
 
 
+# ---- Quant Engine Proxy (reads from Redis) ----
+
+@app.get("/api/quant/{symbol}/summary")
+async def get_quant_summary(symbol: str):
+    """Proxy quant summary from Redis (avoids frontend needing quant-engine port)."""
+    redis = await get_redis()
+    cached = await redis.get(f"quant:{symbol.upper()}")
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            pass
+    raise HTTPException(404, f"No quant data for {symbol}. Quant engine may not have computed yet.")
+
+
+@app.get("/api/quant/all")
+async def get_all_quant_summaries():
+    """Get all cached quant summaries from Redis."""
+    redis = await get_redis()
+    keys = []
+    async for key in redis.scan_iter(match="quant:*"):
+        keys.append(key)
+    results = []
+    if keys:
+        values = await redis.mget(keys)
+        for val in values:
+            if val:
+                try:
+                    results.append(json.loads(val))
+                except json.JSONDecodeError:
+                    pass
+    return results
+
+
 # ---- Service Health Overview ----
 
 @app.get("/api/services/health")
@@ -255,6 +289,31 @@ async def services_health():
             except Exception:
                 results[name] = "unavailable"
     return results
+
+
+# ---- Stock Price History (intraday) ----
+
+@app.get("/api/history/stock-price")
+async def get_stock_price_history(symbol: str, time_range: str = "1d"):
+    flux_range = {"1d": "-1d", "3d": "-3d", "1w": "-7d", "1m": "-30d"}.get(time_range, "-1d")
+    aggregate = ""
+    if time_range == "1m":
+        aggregate = '|> aggregateWindow(every: 1h, fn: mean, createEmpty: false)'
+    elif time_range == "1w":
+        aggregate = '|> aggregateWindow(every: 15m, fn: mean, createEmpty: false)'
+
+    query = f'''
+    from(bucket: "{settings.influxdb_bucket}")
+      |> range(start: {flux_range})
+      |> filter(fn: (r) => r._measurement == "stock_quote" and r.symbol == "{symbol.upper()}" and r._field == "price")
+      {aggregate}
+      |> sort(columns: ["_time"])
+    '''
+    rows = await influx_query(query)
+    return [
+        {"time": r["_time"], "price": float(r["_value"])}
+        for r in rows if r.get("_value") is not None
+    ]
 
 
 # ---- Greek History ----

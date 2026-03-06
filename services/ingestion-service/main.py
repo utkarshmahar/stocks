@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from schwab.client import Client
@@ -37,13 +38,16 @@ async def get_watchlist_symbols() -> list[str]:
     return settings.symbols_list
 
 
+ET = ZoneInfo("America/New_York")
+
+
 def is_normal_trading_hours() -> bool:
     """Check if current time is within normal trading hours (9:30 AM - 4:00 PM ET).
 
     Options data is only written to InfluxDB during these hours.
     Excludes weekends and US market holidays.
     """
-    now = datetime.now(tz=timezone.utc).astimezone()  # Local time (ET on Pi)
+    now = datetime.now(tz=ET)
     weekday = now.weekday()  # 0=Monday, 6=Sunday
 
     # Skip weekends
@@ -65,7 +69,7 @@ def is_extended_trading_hours() -> bool:
     Stock prices are written to InfluxDB during these hours.
     Excludes weekends and US market holidays.
     """
-    now = datetime.now(tz=timezone.utc).astimezone()  # Local time (ET on Pi)
+    now = datetime.now(tz=ET)
     weekday = now.weekday()  # 0=Monday, 6=Sunday
 
     # Skip weekends

@@ -68,9 +68,71 @@ interface OptionPriceHistoryResponse {
 const GREEK_LABELS: Record<string, string> = { iv: 'IV', delta: 'Delta', gamma: 'Gamma', theta: 'Theta' }
 const TIME_RANGES = ['1d', '3d', '1w', '1m'] as const
 
+// Market hours: 9:30 AM - 4:00 PM Eastern Time
+const MARKET_OPEN_HOUR = 9
+const MARKET_OPEN_MIN = 30
+const MARKET_CLOSE_HOUR = 16
+const MARKET_CLOSE_MIN = 0
+
+function toEastern(d: Date): Date {
+  // Convert to Eastern time using Intl
+  const eastern = new Date(d.toLocaleString('en-US', { timeZone: 'America/New_York' }))
+  return eastern
+}
+
+const EXTENDED_OPEN_HOUR = 4
+const EXTENDED_OPEN_MIN = 0
+const EXTENDED_CLOSE_HOUR = 20
+const EXTENDED_CLOSE_MIN = 0
+
+function getEasternMinutes(d: Date): number {
+  const et = toEastern(d)
+  return et.getHours() * 60 + et.getMinutes()
+}
+
+function isMarketHours(d: Date): boolean {
+  const totalMin = getEasternMinutes(d)
+  return totalMin >= MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN && totalMin <= MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN
+}
+
+function isExtendedHours(d: Date): boolean {
+  const totalMin = getEasternMinutes(d)
+  return totalMin >= EXTENDED_OPEN_HOUR * 60 + EXTENDED_OPEN_MIN && totalMin <= EXTENDED_CLOSE_HOUR * 60 + EXTENDED_CLOSE_MIN
+}
+
+function getEasternDateStr(d: Date): string {
+  const et = toEastern(d)
+  return `${et.getFullYear()}-${et.getMonth()}-${et.getDate()}`
+}
+
+/** Filter time-series data to market hours only and insert null gaps between days */
+function filterMarketHours<T extends Record<string, any>>(data: T[], timeKey: string, valueKeys: string[]): T[] {
+  if (!data || data.length === 0) return data
+  const filtered = data.filter(p => {
+    try { return isMarketHours(new Date(p[timeKey])) } catch { return true }
+  })
+  if (filtered.length === 0) return filtered
+  // Insert gap entries between different trading days
+  const result: T[] = []
+  let prevDateStr = ''
+  for (const point of filtered) {
+    const dateStr = getEasternDateStr(new Date(point[timeKey]))
+    if (prevDateStr && dateStr !== prevDateStr) {
+      // Insert a gap marker with null values
+      const gap = { [timeKey]: point[timeKey] } as any
+      for (const k of valueKeys) gap[k] = null
+      gap._gap = true
+      result.push(gap)
+    }
+    result.push(point)
+    prevDateStr = dateStr
+  }
+  return result
+}
+
 export default function Dashboard() {
   const [selectedSymbol, setSelectedSymbol] = useState('PANW')
-  const [priceHistory, setPriceHistory] = useState<{ time: string; price: number }[]>([])
+  const [livePriceTicks, setLivePriceTicks] = useState<{ time: string; price: number }[]>([])
   const [greekModal, setGreekModal] = useState<GreekModal | null>(null)
   const [priceModal, setPriceModal] = useState<PriceModal | null>(null)
   const [timeRange, setTimeRange] = useState<string>('1d')
@@ -100,6 +162,13 @@ export default function Dashboard() {
     queryKey: ['options', selectedSymbol],
     queryFn: () => apiFetch<{ calls: OptionContract[]; puts: OptionContract[] }>(`/options/${selectedSymbol}`),
     staleTime: Infinity, // only fetch once, WebSocket takes over
+  })
+
+  // Fetch intraday price history from InfluxDB for instant chart rendering
+  const { data: stockPriceHistory } = useQuery({
+    queryKey: ['stockPriceHistory', selectedSymbol],
+    queryFn: () => apiFetch<{ time: string; price: number }[]>(`/history/stock-price?symbol=${selectedSymbol}&time_range=1d`),
+    staleTime: 60_000, // refresh every 60s
   })
 
   // Use live data if available, fall back to initial HTTP fetch
@@ -179,11 +248,11 @@ export default function Dashboard() {
       }))
     }
 
-    // Update price chart for selected symbol
+    // Append live tick for selected symbol
     if (sym === selectedSymbol && lastMessage.quote?.price) {
-      setPriceHistory(prev => {
-        const next = [...prev, { time: new Date().toLocaleTimeString(), price: lastMessage.quote.price }]
-        return next.slice(-60)
+      setLivePriceTicks(prev => {
+        const next = [...prev, { time: new Date().toISOString(), price: lastMessage.quote.price }]
+        return next.slice(-120)
       })
     }
   }, [lastMessage, selectedSymbol])
@@ -270,6 +339,16 @@ export default function Dashboard() {
     </td>
   )
 
+  // Filter greek history data to market hours
+  const filteredGreekHistory = useMemo(() => {
+    if (!greekHistory) return null
+    return {
+      ...greekHistory,
+      greek_history: filterMarketHours(greekHistory.greek_history || [], 'time', ['value']),
+      price_history: filterMarketHours(greekHistory.price_history || [], 'time', ['value']),
+    }
+  }, [greekHistory])
+
   // Merge bid/ask/last histories into a single array for combined chart
   const mergedOptionPrices = useMemo(() => {
     if (!optionPriceHistory) return []
@@ -289,8 +368,61 @@ export default function Dashboard() {
       entry.last = p.value
       timeMap.set(p.time, entry)
     }
-    return Array.from(timeMap.values()).sort((a, b) => a.time.localeCompare(b.time))
+    const merged = Array.from(timeMap.values()).sort((a, b) => a.time.localeCompare(b.time))
+    return filterMarketHours(merged, 'time', ['bid', 'ask', 'last'])
   }, [optionPriceHistory])
+
+  // Filter option price stock history to market hours
+  const filteredOptionPriceHistory = useMemo(() => {
+    if (!optionPriceHistory?.price_history) return []
+    return filterMarketHours(optionPriceHistory.price_history, 'time', ['value'])
+  }, [optionPriceHistory])
+
+  // Merge historical price data with live ticks, split into regular/extended hours
+  const priceHistory = useMemo(() => {
+    const historical = (stockPriceHistory || []).map(p => ({ time: p.time, price: p.price }))
+    const lastHistTime = historical.length > 0 ? historical[historical.length - 1].time : ''
+    const newTicks = livePriceTicks.filter(t => t.time > lastHistTime)
+    const all = [...historical, ...newTicks]
+
+    // Filter to extended hours only (remove overnight), split into regular/extended prices
+    const filtered = all.filter(p => {
+      try { return isExtendedHours(new Date(p.time)) } catch { return true }
+    })
+
+    // Build chart data with regularPrice / extendedPrice split + day gaps
+    const result: { time: string; regularPrice?: number | null; extendedPrice?: number | null }[] = []
+    let prevDateStr = ''
+    for (let i = 0; i < filtered.length; i++) {
+      const p = filtered[i]
+      const d = new Date(p.time)
+      const dateStr = getEasternDateStr(d)
+      const regular = isMarketHours(d)
+
+      // Insert gap between trading days
+      if (prevDateStr && dateStr !== prevDateStr) {
+        result.push({ time: p.time, regularPrice: null, extendedPrice: null })
+      }
+
+      if (regular) {
+        // At boundary with previous extended point, duplicate to connect the lines
+        const prev = result.length > 0 ? result[result.length - 1] : null
+        if (prev && prev.extendedPrice != null && prev.regularPrice == null) {
+          prev.regularPrice = prev.extendedPrice
+        }
+        result.push({ time: p.time, regularPrice: p.price, extendedPrice: null })
+      } else {
+        // At boundary with previous regular point, duplicate to connect the lines
+        const prev = result.length > 0 ? result[result.length - 1] : null
+        if (prev && prev.regularPrice != null && prev.extendedPrice == null) {
+          prev.extendedPrice = prev.regularPrice
+        }
+        result.push({ time: p.time, regularPrice: null, extendedPrice: p.price })
+      }
+      prevDateStr = dateStr
+    }
+    return result
+  }, [stockPriceHistory, livePriceTicks])
 
   return (
     <div className="space-y-6">
@@ -307,7 +439,7 @@ export default function Dashboard() {
         {activeSymbols.map((sym: string) => (
           <button
             key={sym}
-            onClick={() => { setSelectedSymbol(sym); setPriceHistory([]) }}
+            onClick={() => { setSelectedSymbol(sym); setLivePriceTicks([]) }}
             className={`px-4 py-2 rounded font-medium text-sm transition-colors ${
               selectedSymbol === sym
                 ? 'bg-emerald-600 text-white'
@@ -342,16 +474,26 @@ export default function Dashboard() {
       {/* Price Chart */}
       {priceHistory.length > 1 && (
         <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
-          <h3 className="text-sm font-medium text-gray-400 mb-2">Intraday Price</h3>
+          <h3 className="text-sm font-medium text-gray-400 mb-2">
+            Intraday Price
+            <span className="ml-3 text-xs font-normal"><span className="text-emerald-400">&#9632;</span> Market Hours <span className="text-emerald-800 ml-2">&#9632;</span> Extended Hours</span>
+          </h3>
           <ResponsiveContainer width="100%" height={200}>
             <LineChart data={priceHistory}>
-              <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke="#666" />
+              <XAxis dataKey="time" tickFormatter={(t: string) => { try { return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) } catch { return t } }} tick={{ fontSize: 10 }} stroke="#666" />
               <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10 }} stroke="#666" />
               <Tooltip
                 contentStyle={{ background: '#1f2937', border: '1px solid #374151' }}
                 labelStyle={{ color: '#9ca3af' }}
+                labelFormatter={(t: string) => { try { return new Date(t).toLocaleTimeString() } catch { return t } }}
+                formatter={(v: any, name: string) => {
+                  if (v == null) return [null, null]
+                  const label = name === 'regularPrice' ? 'Price (Market)' : 'Price (Extended)'
+                  return [`$${Number(v).toFixed(2)}`, label]
+                }}
               />
-              <Line type="monotone" dataKey="price" stroke="#10b981" dot={false} strokeWidth={2} />
+              <Line type="monotone" dataKey="regularPrice" stroke="#10b981" dot={false} strokeWidth={2} connectNulls={false} name="regularPrice" />
+              <Line type="monotone" dataKey="extendedPrice" stroke="#10b98140" dot={false} strokeWidth={1.5} connectNulls={false} name="extendedPrice" />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -483,19 +625,19 @@ export default function Dashboard() {
             <div className="p-5">
               {greekLoading ? (
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">Loading history...</div>
-              ) : !greekHistory?.greek_history?.length && !greekHistory?.price_history?.length ? (
+              ) : !filteredGreekHistory?.greek_history?.length && !filteredGreekHistory?.price_history?.length ? (
                 <div className="flex items-center justify-center h-96 text-gray-500 text-lg">No historical data available for this contract and time range.</div>
               ) : (
                 <div className="space-y-8">
                   <div>
                     <h3 className="text-base font-medium text-purple-400 mb-3">{GREEK_LABELS[greekModal.greek]} Over Time</h3>
-                    {greekHistory?.greek_history?.length ? (
+                    {filteredGreekHistory?.greek_history?.length ? (
                       <ResponsiveContainer width="100%" height={350}>
-                        <LineChart data={greekHistory.greek_history}>
+                        <LineChart data={filteredGreekHistory.greek_history}>
                           <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [v.toFixed(4), GREEK_LABELS[greekModal.greek]]} />
-                          <Line type="monotone" dataKey="value" stroke="#8b5cf6" dot={false} strokeWidth={2.5} />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [v != null ? v.toFixed(4) : '', GREEK_LABELS[greekModal.greek]]} />
+                          <Line type="monotone" dataKey="value" stroke="#8b5cf6" dot={false} strokeWidth={2.5} connectNulls={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     ) : (
@@ -504,13 +646,13 @@ export default function Dashboard() {
                   </div>
                   <div>
                     <h3 className="text-base font-medium text-emerald-400 mb-3">{greekModal.symbol} Price Over Time</h3>
-                    {greekHistory?.price_history?.length ? (
+                    {filteredGreekHistory?.price_history?.length ? (
                       <ResponsiveContainer width="100%" height={350}>
-                        <LineChart data={greekHistory.price_history}>
+                        <LineChart data={filteredGreekHistory.price_history}>
                           <XAxis dataKey="time" tickFormatter={formatGreekTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']} />
-                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatGreekTime} formatter={(v: number) => [v != null ? `$${v.toFixed(2)}` : '', 'Price']} />
+                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} connectNulls={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     ) : (
@@ -559,11 +701,11 @@ export default function Dashboard() {
                         <LineChart data={mergedOptionPrices}>
                           <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number, name: string) => [`$${v.toFixed(2)}`, name.charAt(0).toUpperCase() + name.slice(1)]} />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number, name: string) => [v != null ? `$${v.toFixed(2)}` : '', name.charAt(0).toUpperCase() + name.slice(1)]} />
                           <Legend wrapperStyle={{ fontSize: 13 }} />
-                          <Line type="monotone" dataKey="bid" stroke="#f59e0b" dot={false} strokeWidth={2} name="Bid" />
-                          <Line type="monotone" dataKey="ask" stroke="#ef4444" dot={false} strokeWidth={2} name="Ask" />
-                          <Line type="monotone" dataKey="last" stroke="#3b82f6" dot={false} strokeWidth={2.5} name="LTP" />
+                          <Line type="monotone" dataKey="bid" stroke="#f59e0b" dot={false} strokeWidth={2} name="Bid" connectNulls={false} />
+                          <Line type="monotone" dataKey="ask" stroke="#ef4444" dot={false} strokeWidth={2} name="Ask" connectNulls={false} />
+                          <Line type="monotone" dataKey="last" stroke="#3b82f6" dot={false} strokeWidth={2.5} name="LTP" connectNulls={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     ) : (
@@ -572,13 +714,13 @@ export default function Dashboard() {
                   </div>
                   <div>
                     <h3 className="text-base font-medium text-emerald-400 mb-3">{priceModal.symbol} Stock Price Over Time</h3>
-                    {optionPriceHistory?.price_history?.length ? (
+                    {filteredOptionPriceHistory?.length ? (
                       <ResponsiveContainer width="100%" height={350}>
-                        <LineChart data={optionPriceHistory.price_history}>
+                        <LineChart data={filteredOptionPriceHistory}>
                           <XAxis dataKey="time" tickFormatter={formatPriceTime} tick={{ fontSize: 12 }} stroke="#666" />
                           <YAxis domain={['auto', 'auto']} tick={{ fontSize: 12 }} stroke="#666" width={70} />
-                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number) => [`$${v.toFixed(2)}`, 'Price']} />
-                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} />
+                          <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 14 }} labelStyle={{ color: '#9ca3af' }} labelFormatter={formatPriceTime} formatter={(v: number) => [v != null ? `$${v.toFixed(2)}` : '', 'Price']} />
+                          <Line type="monotone" dataKey="value" stroke="#10b981" dot={false} strokeWidth={2.5} connectNulls={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     ) : (

@@ -111,3 +111,63 @@ class FundamentalReport(BaseModel):
     ai_narrative: Optional[str] = None
     report_data: dict = {}
     created_at: datetime = datetime.utcnow()
+
+
+# ---- Quant Engine V2 Models ----
+
+class EarningsInfo(BaseModel):
+    earnings_nearby: bool = False
+    earnings_date: Optional[str] = None
+    days_until_earnings: Optional[int] = None
+
+
+class StrikeCandidate(BaseModel):
+    strike: float
+    expiration: str
+    option_type: str  # CALL or PUT
+    delta: float
+    mid_price: float
+    bid: float = 0.0
+    ask: float = 0.0
+    prob_otm: float  # 1 - |delta|
+    spread_quality: float  # (ask - bid) / mid, lower is better
+    annualized_return: float  # (premium / capital) * (365 / dte)
+    capital_required: float
+    dte: int
+    volume: int = 0
+    open_interest: int = 0
+
+
+class StrategyScreen(BaseModel):
+    strategy_name: str  # "Covered Call", "Cash-Secured Put"
+    strategy_slug: str  # "covered_call", "cash_secured_put"
+    candidates: list[StrikeCandidate] = []
+
+
+class QuantSummaryV2(BaseModel):
+    symbol: str
+    current_price: float
+    # IV metrics
+    iv_percentile: Optional[float] = None
+    iv_rank: Optional[float] = None
+    current_iv: Optional[float] = None
+    iv_trend: Optional[float] = None  # slope: positive = rising
+    # Flow metrics
+    put_call_skew: Optional[float] = None
+    volume_oi_ratio: Optional[float] = None
+    unusual_activity: bool = False
+    total_call_volume: int = 0
+    total_put_volume: int = 0
+    total_call_oi: int = 0
+    total_put_oi: int = 0
+    # Market regime
+    vix_level: Optional[float] = None
+    expected_weekly_move: Optional[float] = None
+    expected_move_pct: Optional[float] = None
+    # Earnings
+    earnings: EarningsInfo = EarningsInfo()
+    # Strategy screens
+    strategy_screens: list[StrategyScreen] = []
+    # Meta
+    computed_at: datetime = datetime.utcnow()
+    source: str = "scheduler"  # "scheduler" or "on_demand"

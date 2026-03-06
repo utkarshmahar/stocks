@@ -11,6 +11,9 @@ COPY services/quant-engine/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY services/quant-engine/main.py .
+COPY services/quant-engine/scheduler.py .
+COPY services/quant-engine/computations/ /app/computations/
+COPY services/quant-engine/strategies/ /app/strategies/
 
 ENV PYTHONUNBUFFERED=1
 

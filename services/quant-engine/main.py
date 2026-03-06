@@ -1,155 +1,112 @@
-"""Quant Engine — Deterministic IV percentile, skew, term structure analysis."""
-import numpy as np
-from datetime import datetime
+"""Quant Engine — Pre-computed quant summaries with strategy screening.
+
+Endpoints read from Redis (fast) with fallback to on-demand compute.
+A background scheduler computes every 5 minutes during market hours.
+"""
+import asyncio
+import json
+import logging
 
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 
 from shared.config import get_settings
 from shared.health import health_router
 from shared.influxdb_client import influx_query
-from shared.models import QuantSummary
+from shared.redis_client import get_redis
+from shared.models import QuantSummaryV2
 
-app = FastAPI(title="Quant Engine")
-app.include_router(health_router)
+from scheduler import scheduler_loop, run_compute_cycle, compute_symbol
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
 
-async def get_iv_history(symbol: str, days: int = 30) -> list[float]:
-    """Get historical IV values from InfluxDB."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the background scheduler on app startup."""
+    task = asyncio.create_task(scheduler_loop())
+    logger.info("Scheduler task started")
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Quant Engine", lifespan=lifespan)
+app.include_router(health_router)
+
+
+@app.get("/api/quant/{symbol}/summary")
+async def quant_summary(symbol: str):
+    """Get quant summary for a symbol. Reads from Redis, falls back to on-demand compute."""
+    symbol = symbol.upper()
+    redis = await get_redis()
+    cached = await redis.get(f"quant:{symbol}")
+
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: compute on demand
+    logger.info("Cache miss for %s, computing on demand", symbol)
+    result = await compute_symbol(symbol)
+    if result is None:
+        raise HTTPException(404, f"No data for {symbol}")
+
+    result.source = "on_demand"
+    # Store in Redis for subsequent requests
+    await redis.setex(f"quant:{symbol}", 600, result.model_dump_json())
+    return result.model_dump()
+
+
+@app.get("/api/quant/all")
+async def quant_all():
+    """Get all cached quant summaries from Redis."""
+    redis = await get_redis()
+    keys = []
+    async for key in redis.scan_iter(match="quant:*"):
+        keys.append(key)
+
+    results = []
+    if keys:
+        values = await redis.mget(keys)
+        for val in values:
+            if val:
+                try:
+                    results.append(json.loads(val))
+                except json.JSONDecodeError:
+                    pass
+
+    return results
+
+
+@app.post("/api/quant/refresh")
+async def quant_refresh():
+    """Force recompute for all watchlist symbols."""
+    logger.info("Manual refresh triggered")
+    computed = await run_compute_cycle()
+    return {"status": "ok", "symbols_computed": computed}
+
+
+@app.get("/api/quant/{symbol}/iv-history")
+async def iv_history_endpoint(symbol: str, days: int = 30):
+    """Get raw IV history from InfluxDB (unchanged from v1)."""
     query = f'''
     from(bucket: "{settings.influxdb_bucket}")
       |> range(start: -{days}d)
-      |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol}")
+      |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol.upper()}")
       |> filter(fn: (r) => r._field == "implied_volatility")
       |> filter(fn: (r) => r.option_type == "CALL")
       |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
       |> yield(name: "iv_history")
     '''
     rows = await influx_query(query)
-    return [float(r.get("_value", 0)) for r in rows if r.get("_value")]
-
-
-async def get_current_iv(symbol: str) -> float | None:
-    """Get current average IV for ATM options."""
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
-      |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol}")
-      |> filter(fn: (r) => r._field == "implied_volatility")
-      |> last()
-      |> mean()
-    '''
-    rows = await influx_query(query)
-    if rows:
-        val = rows[0].get("_value")
-        return float(val) if val else None
-    return None
-
-
-async def get_put_call_data(symbol: str) -> dict:
-    """Get latest put and call IV for skew calculation."""
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
-      |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol}")
-      |> filter(fn: (r) => r._field == "implied_volatility")
-      |> last()
-      |> group(columns: ["option_type"])
-      |> mean()
-    '''
-    rows = await influx_query(query)
-    result = {}
-    for r in rows:
-        otype = r.get("option_type", "")
-        val = r.get("_value")
-        if val:
-            result[otype] = float(val)
-    return result
-
-
-async def get_volume_oi(symbol: str) -> dict:
-    """Get volume and open interest for unusual activity detection."""
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
-      |> filter(fn: (r) => r._measurement == "options_data" and r.symbol == "{symbol}")
-      |> filter(fn: (r) => r._field == "volume" or r._field == "open_interest")
-      |> last()
-      |> sum()
-    '''
-    rows = await influx_query(query)
-    result = {"volume": 0, "open_interest": 0}
-    for r in rows:
-        field = r.get("_field", "")
-        val = r.get("_value")
-        if field in result and val:
-            result[field] = int(float(val))
-    return result
-
-
-async def get_current_price(symbol: str) -> float:
-    """Get current underlying price."""
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-      |> range(start: -5m)
-      |> filter(fn: (r) => r._measurement == "stock_quote" and r.symbol == "{symbol}")
-      |> filter(fn: (r) => r._field == "price")
-      |> last()
-    '''
-    rows = await influx_query(query)
-    if rows:
-        val = rows[0].get("_value")
-        if val:
-            return float(val)
-    return 0.0
-
-
-@app.get("/api/quant/{symbol}/summary", response_model=QuantSummary)
-async def quant_summary(symbol: str):
-    symbol = symbol.upper()
-    price = await get_current_price(symbol)
-    if price == 0:
-        raise HTTPException(404, f"No data for {symbol}")
-
-    # IV Percentile (30-day)
-    iv_history = await get_iv_history(symbol, 30)
-    current_iv = await get_current_iv(symbol)
-    iv_percentile = None
-    iv_rank = None
-    if iv_history and current_iv:
-        iv_percentile = sum(1 for v in iv_history if v < current_iv) / len(iv_history)
-        iv_min = min(iv_history)
-        iv_max = max(iv_history)
-        if iv_max > iv_min:
-            iv_rank = (current_iv - iv_min) / (iv_max - iv_min)
-
-    # Put/Call skew
-    pc_data = await get_put_call_data(symbol)
-    put_call_skew = None
-    if "PUT" in pc_data and "CALL" in pc_data and pc_data["CALL"] > 0:
-        put_call_skew = pc_data["PUT"] / pc_data["CALL"]
-
-    # Volume/OI ratio
-    vol_oi = await get_volume_oi(symbol)
-    vol_oi_ratio = None
-    unusual = False
-    if vol_oi["open_interest"] > 0:
-        vol_oi_ratio = vol_oi["volume"] / vol_oi["open_interest"]
-        unusual = vol_oi_ratio > 1.5
-
-    return QuantSummary(
-        symbol=symbol,
-        current_price=price,
-        iv_percentile=iv_percentile,
-        iv_rank=iv_rank,
-        put_call_skew=put_call_skew,
-        unusual_activity=unusual,
-        volume_oi_ratio=vol_oi_ratio,
-    )
-
-
-@app.get("/api/quant/{symbol}/iv-history")
-async def iv_history_endpoint(symbol: str, days: int = 30):
-    history = await get_iv_history(symbol.upper(), days)
-    return {"symbol": symbol.upper(), "days": days, "iv_values": history}
+    iv_values = [float(r.get("_value", 0)) for r in rows if r.get("_value")]
+    return {"symbol": symbol.upper(), "days": days, "iv_values": iv_values}

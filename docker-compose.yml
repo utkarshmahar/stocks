@@ -20,6 +20,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+      - ./migrations/002_earnings_calendar.sql:/docker-entrypoint-initdb.d/002_earnings_calendar.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
@@ -102,8 +103,12 @@ services:
       context: .
       dockerfile: services/quant-engine/Dockerfile
     profiles: ["full"]
+    volumes:
+      - ./schwab_token.json:/app/schwab_token.json:ro
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     deploy:
       resources:
